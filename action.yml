@@ -1,0 +1,297 @@
+name: SFDX Apex Execute
+description: GitHub composite action to execute anonymous Apex in an org, e.g. post-deploy scripts, data migrations or cache clearing.
+
+branding:
+  icon: terminal
+  color: blue
+
+inputs:
+  file-path:
+    description: >
+      Comma-separated list of files containing the anonymous Apex to execute, in the given order.
+      Each entry may also be a glob pattern, for example "./scripts/apex/*.apex", which is expanded
+      and executed in alphabetical order - handy for a folder of numbered post-deploy scripts.
+      An entry that matches no file fails the step.
+    required: false
+  apex-code:
+    description: >
+      Anonymous Apex to execute inline, as an alternative to file-path.
+      If both inputs are provided, the files are executed first and the inline snippet last.
+    required: false
+  target-org:
+    description: Username or alias of the target org. Not required if default org is already set.
+    required: false
+  api-version:
+    description: Override the api version used for api requests made by this action, for example '59.0'.
+    required: false
+  fail-fast:
+    description: Stop at the first failing script. Set to false to execute all scripts and fail the step afterwards.
+    required: false
+    default: 'true'
+  log-output:
+    description: >
+      How much of the Apex debug log to print for a successful execution.
+      Permissible values: debug (only the System.debug output), full (the complete debug log
+      in a collapsible group), none. A failing execution always prints the error and the
+      complete debug log, regardless of this setting.
+    required: false
+    default: debug
+  output-dir:
+    description: Directory to write the debug log of each execution to, for example './logs/apex' to upload them as a build artifact. Disabled when empty.
+    required: false
+  step-summary:
+    description: Write a result section to the GitHub Actions job summary. Set to false to avoid collisions with a custom workflow summary.
+    required: false
+    default: 'true'
+
+outputs:
+  success:
+    description: '"true" when every executed script succeeded, otherwise "false".'
+    value: ${{ steps.apex.outputs.success }}
+  scripts-run:
+    description: Number of scripts that were executed.
+    value: ${{ steps.apex.outputs.scripts-run }}
+  failed-script:
+    description: The first script that failed, empty if all succeeded.
+    value: ${{ steps.apex.outputs.failed-script }}
+
+runs:
+  using: composite
+  steps:
+    - name: Execute Anonymous Apex
+      id: apex
+      shell: bash
+      env:
+        FILE_PATH: ${{ inputs.file-path }}
+        APEX_CODE: ${{ inputs.apex-code }}
+        TARGET_ORG: ${{ inputs.target-org }}
+        API_VERSION: ${{ inputs.api-version }}
+        FAIL_FAST: ${{ inputs.fail-fast }}
+        LOG_OUTPUT: ${{ inputs.log-output }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        STEP_SUMMARY: ${{ inputs.step-summary }}
+      run: |
+        set -uo pipefail
+
+        # We aggregate the result across all scripts ourselves via `overall_exit`,
+        # so disable errexit (GitHub runs composite shells with `-e` by default).
+        # This keeps the loop, the outputs and the job summary alive after a
+        # failing execution instead of aborting the step mid-way.
+        set +e
+
+        overall_exit=0
+
+        # Extract the JSON object from CLI output that may be prefixed with
+        # npm/plugin JIT-install noise (some of which contains "{"). Keeps
+        # everything from the first line that starts with "{".
+        extract_json() { awk '/^[[:space:]]*\{/{f=1} f'; }
+
+        # Trim leading/trailing whitespace without touching the rest of the value.
+        trim() {
+          local s="$1"
+          s="${s#"${s%%[![:space:]]*}"}"
+          printf '%s' "${s%"${s##*[![:space:]]}"}"
+        }
+
+        # Reduce a raw Apex debug log to its System.debug output. A USER_DEBUG
+        # entry can span multiple lines, so keep printing until the next
+        # timestamped log entry starts. The four leading pipe-delimited fields
+        # (timestamp, event, line, level) are stripped from the first line.
+        debug_lines() {
+          awk '
+            /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+ \([0-9]+\)\|/ {
+              keep = ($0 ~ /\|USER_DEBUG\|/)
+              if (keep) { sub(/^[^|]*\|[^|]*\|[^|]*\|[^|]*\|/, ""); print }
+              next
+            }
+            keep { print }
+          '
+        }
+
+        # The inline snippet is executed from a temporary file, so report it
+        # under a name that means something in the log and the summary.
+        inline_script=""
+        label_for() {
+          if [[ -n "$inline_script" && "$1" == "$inline_script" ]]; then
+            printf 'apex-code (inline)'
+          else
+            printf '%s' "$1"
+          fi
+        }
+
+        # ------------------------- Collect the scripts ------------------------
+        scripts=()
+
+        if [[ -n "$FILE_PATH" ]]; then
+          IFS=',' read -ra patterns <<< "$FILE_PATH"
+          for pattern in "${patterns[@]}"; do
+            pattern="$(trim "$pattern")"
+            [[ -z "$pattern" ]] && continue
+
+            # compgen expands a glob and echoes a plain path unchanged, so both
+            # forms go through the same branch. Sorted for a deterministic order.
+            matches=()
+            while IFS= read -r match; do
+              [[ -f "$match" ]] && matches+=("$match")
+            done < <(compgen -G "$pattern" | sort)
+
+            if [[ ${#matches[@]} -eq 0 ]]; then
+              echo "::error::No Apex script found for '$pattern'."
+              exit 1
+            fi
+            scripts+=("${matches[@]}")
+          done
+        fi
+
+        if [[ -n "$APEX_CODE" ]]; then
+          inline_script="${RUNNER_TEMP:-/tmp}/sfdx-apex-execute-inline.apex"
+          printf '%s\n' "$APEX_CODE" > "$inline_script"
+          scripts+=("$inline_script")
+        fi
+
+        if [[ ${#scripts[@]} -eq 0 ]]; then
+          echo "::error::Nothing to execute - provide either the 'file-path' or the 'apex-code' input."
+          exit 1
+        fi
+
+        [[ -n "$OUTPUT_DIR" ]] && mkdir -p "$OUTPUT_DIR"
+
+        # --------------------------- Execute in order -------------------------
+        executed=0
+        index=0
+        aborted=false
+        failed_script=""
+        rows=()
+
+        for script in "${scripts[@]}"; do
+          index=$((index + 1))
+          label="$(label_for "$script")"
+
+          echo "▶️ Executing $label..."
+
+          args=(--file "$script")
+          [[ -n "$TARGET_ORG" ]] && args+=(--target-org "$TARGET_ORG")
+          [[ -n "$API_VERSION" ]] && args+=(--api-version "$API_VERSION")
+
+          raw=$(sf apex run --json "${args[@]}") && code=0 || code=$?
+          result=$(printf '%s\n' "$raw" | extract_json)
+          executed=$((executed + 1))
+
+          # On success the CLI reports the execution under `.result`; when the
+          # code fails to compile or throws, it reports an error object and moves
+          # the very same payload to `.data`.
+          payload=$(echo "$result" | jq -c '.result // .data // {}' 2>/dev/null)
+          [[ -z "$payload" ]] && payload='{}'
+          logs=$(echo "$payload" | jq -r '.logs // ""')
+
+          if [[ -n "$OUTPUT_DIR" ]]; then
+            printf '%s\n' "$logs" > "${OUTPUT_DIR}/$(printf '%02d' "$index")-$(basename "$script").log"
+          fi
+
+          if [[ $code -eq 0 ]]; then
+            # The System.debug output is the whole point of a post-deploy script,
+            # so print it unfolded; the complete log is noisy enough to fold away.
+            case "$LOG_OUTPUT" in
+              debug)
+                debug_out=$(printf '%s\n' "$logs" | debug_lines)
+                [[ -n "$debug_out" ]] && printf '%s\n' "$debug_out"
+                ;;
+              full)
+                echo "::group::$label · debug log"
+                printf '%s\n' "$logs"
+                echo "::endgroup::"
+                ;;
+            esac
+
+            echo "✅ $label executed successfully"
+            rows+=("| $index | \`$label\` | ✅ Success |")
+          else
+            failed_script="${failed_script:-$label}"
+            overall_exit=1
+
+            if ! echo "$result" | jq -e . >/dev/null 2>&1; then
+              echo "⚠️ The CLI returned unexpected non-JSON output:"
+              printf '%s\n' "$raw"
+            fi
+
+            # Without a payload the CLI failed before it ever ran the code (bad
+            # org, expired auth, ...), so don't blame the Apex for it.
+            compiled=$(echo "$payload" | jq -r '.compiled // empty')
+            if [[ -z "$compiled" ]]; then
+              reason="Execution failed"
+              detail=""
+            elif [[ "$compiled" == "true" ]]; then
+              reason="Runtime exception"
+              detail=$(echo "$payload" | jq -r '.exceptionMessage // ""')
+            else
+              reason="Compilation failed"
+              detail=$(echo "$payload" | jq -r '.compileProblem // ""')
+              line=$(echo "$payload" | jq -r '.line // -1')
+              column=$(echo "$payload" | jq -r '.column // -1')
+              [[ -n "$(trim "$detail")" && "$line" != "-1" ]] && detail="$detail (line $line, column $column)"
+            fi
+
+            # Fall back to the CLI's own error message, then to its raw output,
+            # so a failure never shows up without a reason.
+            detail="$(trim "$detail")"
+            [[ -z "$detail" ]] && detail=$(echo "$result" | jq -r '.message // empty' 2>/dev/null)
+            [[ -z "$detail" ]] && detail=$(printf '%s\n' "$raw" | grep -v '^[[:space:]]*$' | tail -n 1)
+            [[ -z "$detail" ]] && detail="The Salesforce CLI reported no further details."
+
+            echo "❌ $label failed - ${reason}: ${detail}"
+
+            stack=$(echo "$payload" | jq -r '.exceptionStackTrace // ""')
+            [[ -n "$stack" ]] && printf '%s\n' "$stack" | sed 's/^/   /'
+
+            # A failure is exactly when the full log matters, so always show it.
+            if [[ -n "$logs" ]]; then
+              echo "::group::$label · debug log"
+              printf '%s\n' "$logs"
+              echo "::endgroup::"
+            fi
+
+            echo "::error::${label} failed - ${reason}: ${detail//$'\n'/ }"
+            rows+=("| $index | \`$label\` | ❌ $reason |")
+
+            if [[ "$FAIL_FAST" == "true" ]]; then
+              aborted=true
+              break
+            fi
+          fi
+        done
+
+        # Scripts after an aborted run are listed as skipped so the summary still
+        # shows the complete, intended sequence.
+        if [[ "$aborted" == "true" ]]; then
+          for (( i = index; i < ${#scripts[@]}; i++ )); do
+            rows+=("| $((i + 1)) | \`$(label_for "${scripts[$i]}")\` | ⏭️ Skipped |")
+          done
+        fi
+
+        # ------------------------------- Outputs ------------------------------
+        [[ $overall_exit -eq 0 ]] && success=true || success=false
+        {
+          echo "success=$success"
+          echo "scripts-run=$executed"
+          echo "failed-script=$failed_script"
+        } >> "$GITHUB_OUTPUT"
+
+        # ---------------------------- Step summary ----------------------------
+        if [[ "$STEP_SUMMARY" == "true" ]]; then
+          [[ $overall_exit -eq 0 ]] && summary_icon="✅" || summary_icon="❌"
+          {
+            echo ""
+            echo "### ${summary_icon} Anonymous Apex execution"
+            echo ""
+            echo "| # | Script | Result |"
+            echo "| --- | --- | --- |"
+            printf '%s\n' "${rows[@]}"
+            echo ""
+            if [[ -n "$TARGET_ORG" ]]; then
+              echo "- **Target org:** \`$TARGET_ORG\`"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        exit $overall_exit
